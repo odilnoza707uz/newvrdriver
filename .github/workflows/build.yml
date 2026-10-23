@@ -1,0 +1,167 @@
+name: Haydovchi APK yig'ish
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+env:
+  # Sayt manzili (oxirida / bo'lsin). Boshqa domen bo'lsa faqat shu qatorni o'zgartiring.
+  BASE_URL: "https://shop.birzum24.uz/"
+  # Haydovchi ilovasining paket nomi (Firebase'da shu nom bilan Android ilova qo'shilgan bo'lishi kerak)
+  APP_ID: "uz.sdmsys.birzum.driver"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Yuklangan fayllarni tekshirish. Fayl nomi muhim emas: tarkibiga qarab topiladi.
+      - name: 1. Fayllarni tekshirish
+        id: prep
+        run: |
+          set -e
+          say() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          fail() { echo "::error title=TUZATING::$1"; say "## ❌ $1"; [ -n "$2" ] && say "$2"; exit 1; }
+          say "# BirZum Haydovchi — tekshiruv"
+          echo "Repozitoriydagi fayllar:"; ls -la
+
+          # --- Android loyiha (zip yoki ochilgan holda) ---
+          ROOT=""
+          if [ -f settings.gradle.kts ] && [ -d app/src ]; then ROOT="."; fi
+          if [ -z "$ROOT" ]; then
+            for z in *.zip; do
+              [ -f "$z" ] || continue
+              if unzip -l "$z" | grep -q "settings.gradle.kts"; then
+                rm -rf _unz && mkdir -p _unz && unzip -q -o "$z" -d _unz
+                S="$(find _unz -name settings.gradle.kts -not -path '*/node_modules/*' | head -n 1)"
+                ROOT="$(dirname "$S")"; say "✅ Loyiha arxivi: \`$z\`"; break
+              fi
+            done
+          fi
+          [ -n "$ROOT" ] || fail "Android loyiha topilmadi" "Repozitoriy ildiziga **android-project.zip** ni OCHMASDAN yuklang (Add file → Upload files)."
+          for f in app/build.gradle.kts app/src/main/AndroidManifest.xml app/src/main/res/raw/alarm.wav; do
+            [ -f "$ROOT/$f" ] || fail "Loyiha to'liq emas: $f yo'q" "Zipni ochib, fayllarni bittalab yuklamang — butun zipni o'zini yuklang."
+          done
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+          # --- google-services.json (ilova uchun Firebase fayli) ---
+          GS=""; SA=""
+          for j in *.json "$ROOT/app/google-services.json"; do
+            [ -f "$j" ] || continue
+            T="$(python3 -c "
+          import json,sys
+          try: d=json.load(open(sys.argv[1]))
+          except Exception: print('bad'); sys.exit()
+          if d.get('type')=='service_account': print('sa')
+          elif any('android_client_info' in c.get('client_info',{}) for c in d.get('client',[])): print('gs')
+          else: print('other')" "$j")"
+            [ "$T" = "gs" ] && [ -z "$GS" ] && GS="$j"
+            [ "$T" = "sa" ] && SA="$j"
+          done
+          if [ -z "$GS" ]; then
+            if [ -n "$SA" ]; then
+              fail "Noto'g'ri JSON yuklangan: \`$SA\` — bu SERVER kaliti (service account)" "Ilova uchun boshqa fayl kerak: Firebase Console → ⚙️ Project settings → **Your apps** → Android ilova → **google-services.json** (Download). Server kalitini (firebase-adminsdk-...json) GitHub'ga YUKLAMANG va o'chiring — u faqat saytingizdagi fcm.php uchun."
+            fi
+            fail "google-services.json topilmadi" "Firebase Console → ⚙️ Project settings → Your apps → Android ilova → **google-services.json** ni yuklab oling va repozitoriy ildiziga yuklang (nomi o'zgargan bo'lsa ham bo'ladi)."
+          fi
+          [ -n "$SA" ] && echo "::warning title=XAVFSIZLIK::$SA — server kaliti repozitoriyda turibdi. Uni o'chiring (hamma uni ko'rishi mumkin bo'lsa, Firebase'ingizga kira oladi)."
+          [ "$GS" != "$ROOT/app/google-services.json" ] && cp "$GS" "$ROOT/app/google-services.json"
+          PKG="$(python3 -c "
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          cl=[c['client_info']['android_client_info']['package_name'] for c in d['client'] if 'android_client_info' in c.get('client_info',{})]
+          print(sys.argv[2] if sys.argv[2] in cl else 'NOAPP:' + ','.join(cl))" "$ROOT/app/google-services.json" "$APP_ID")"
+          case "$PKG" in NOAPP:*) fail "google-services.json ichida $APP_ID ilovasi yo'q (bor: ${PKG#NOAPP:})" "Firebase Console → ⚙️ Project settings → **Add app** → Android → paket nomi **$APP_ID** → so'ng YANGI google-services.json ni yuklab oling va repozitoriydagi eskisini almashtiring.";; esac
+          say "✅ google-services.json: \`$GS\` — paket nomi **$PKG**"
+          say "✅ Sayt: $BASE_URL"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # GitHub serverida Android SDK oldindan o'rnatilgan — tashqi "setup-android" ishlatilmaydi
+      # (u eski 'tools' paketini so'rab yiqiladi: "Failed to find package 'tools'").
+      - name: 2. Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          [ -d "$SDK" ] || { echo "::error title=SDK::Android SDK topilmadi ($SDK)"; exit 1; }
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          [ -x "$SM" ] || { echo "::error title=SDK::sdkmanager topilmadi"; exit 1; }
+          echo "SDK: $SDK"; echo "sdkmanager: $SM"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+          "$SM" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0" "platform-tools" > /dev/null 2>&1 \
+            || "$SM" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          ls "$SDK/platforms" | tail -n 3
+          echo "✅ Android SDK tayyor" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: 3. Imzolash kaliti
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks" || { echo "::error title=KALIT::KEYSTORE_BASE64 secret buzilgan (to'liq nusxalanmagan)"; exit 1; }
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+            echo "🔐 O'z kalitingiz bilan imzolanadi" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ Sinov kaliti bilan imzolanadi: o'rnatsa bo'ladi, lekin do'konlarga yuklab bo'lmaydi va keyingi versiyani ustidan o'rnatib bo'lmaydi." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # 4) Yig'ish. Yiqilsa — xato qatorlari sahifa tepasida (Summary) va izohlarda chiqadi.
+      - name: 4. Yig'ish (APK + AAB)
+        working-directory: ${{ steps.prep.outputs.root }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          set +e            # GitHub 'bash -e' bilan ishlatadi: xatoda ham xulosa yozilishi uchun o'chiramiz
+          set -o pipefail
+          gradle --no-daemon --console=plain :app:assembleRelease :app:bundleRelease \
+            -PappId="${{ steps.prep.outputs.pkg }}" -PbaseUrl="$BASE_URL" -PversionCode="${{ github.run_number }}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          CODE=$?
+          if [ $CODE -ne 0 ]; then
+            {
+              echo "## ❌ Yig'ish yiqildi"
+              echo "Quyidagi qutidagi matnni to'liq nusxalab menga yuboring:"
+              echo '```'
+              grep -E "^e: |error:|ERROR:|What went wrong|Execution failed|AAPT|Could not|> " "$GITHUB_WORKSPACE/build.log" | grep -v "^> Task" | head -n 40
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -E "^e: |error:" "$GITHUB_WORKSPACE/build.log" | head -n 8 | while IFS= read -r L; do echo "::error title=XATO::${L:0:400}"; done
+            exit $CODE
+          fi
+          {
+            echo "## ✅ Tayyor"
+            echo "Pastdagi **Artifacts** bo'limidan \`birzum-haydovchi-apk\` ni yuklab oling (telefonga o'rnatish uchun)."
+            echo "\`birzum-haydovchi-aab\` — Google Play / RuStore uchun."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Jurnal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: birzum-haydovchi-apk
+          path: ${{ steps.prep.outputs.root }}/app/build/outputs/apk/release/*.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: birzum-haydovchi-aab
+          path: ${{ steps.prep.outputs.root }}/app/build/outputs/bundle/release/*.aab
